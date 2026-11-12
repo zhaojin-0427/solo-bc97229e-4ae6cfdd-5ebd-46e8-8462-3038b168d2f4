@@ -8,6 +8,12 @@ Design points:
 * Every connection has a monotonically increasing per-row ``version`` trigger
   installed, so optimistic-concurrency checks can detect every content or
   status change of a flow.
+* A second set of triggers maintains a monotonic ``data_epoch`` counter in
+  ``meta``: any insert or update of a flow row (raw-value correction, upload,
+  status flip from a confirmation or a group disband) advances the epoch.
+  Recomputation snapshots the epoch together with the flows and only
+  publishes when the epoch is unchanged, so a late computation can never
+  overwrite newer results.
 * Recomputation (candidate matching) only opens short read transactions and
   performs its CPU work outside of any write transaction; it therefore never
   occupies the formal database write transaction.
@@ -102,6 +108,54 @@ BEGIN
        SET version = version + 1,
            updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
      WHERE serial = OLD.serial AND version = OLD.version;
+END;
+
+-- Input-change epoch: every raw-value or claim-status change of a flow row
+-- advances meta['data_epoch']. Recomputation publishes only when the epoch
+-- it snapshotted is still current, which makes the derived candidate table
+-- linearizable with respect to uploads / corrections / confirmations.
+-- NOTE: the lazy counter insert must be `ON CONFLICT(key) DO NOTHING`, not
+-- `INSERT OR IGNORE`: SQLite mis-handles OR IGNORE inside an AFTER UPDATE
+-- trigger that was fired by an UPSERT (INSERT ... ON CONFLICT DO UPDATE)
+-- statement, which is exactly how ledger.upload() writes flow rows.
+CREATE TRIGGER IF NOT EXISTS trg_bank_epoch_ins
+AFTER INSERT ON bank_flows
+FOR EACH ROW
+BEGIN
+    INSERT INTO meta(key, value) VALUES ('data_epoch', '0')
+    ON CONFLICT(key) DO NOTHING;
+    UPDATE meta SET value = CAST(CAST(value AS INTEGER) + 1 AS TEXT)
+     WHERE key = 'data_epoch';
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_bank_epoch_upd
+AFTER UPDATE ON bank_flows
+FOR EACH ROW
+BEGIN
+    INSERT INTO meta(key, value) VALUES ('data_epoch', '0')
+    ON CONFLICT(key) DO NOTHING;
+    UPDATE meta SET value = CAST(CAST(value AS INTEGER) + 1 AS TEXT)
+     WHERE key = 'data_epoch';
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_internal_epoch_ins
+AFTER INSERT ON internal_flows
+FOR EACH ROW
+BEGIN
+    INSERT INTO meta(key, value) VALUES ('data_epoch', '0')
+    ON CONFLICT(key) DO NOTHING;
+    UPDATE meta SET value = CAST(CAST(value AS INTEGER) + 1 AS TEXT)
+     WHERE key = 'data_epoch';
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_internal_epoch_upd
+AFTER UPDATE ON internal_flows
+FOR EACH ROW
+BEGIN
+    INSERT INTO meta(key, value) VALUES ('data_epoch', '0')
+    ON CONFLICT(key) DO NOTHING;
+    UPDATE meta SET value = CAST(CAST(value AS INTEGER) + 1 AS TEXT)
+     WHERE key = 'data_epoch';
 END;
 """
 

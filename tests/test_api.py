@@ -137,3 +137,55 @@ def test_bad_csv_rejected(client):
 
 def test_unknown_candidate_404(client):
     assert client.post("/api/candidates/999999/confirm", json={}).status_code == 404
+
+
+def test_correction_recompute_lists_only_current_combo(client):
+    """End-to-end version of the reported scenario: after corrections swap
+    the amounts, a recompute must list only the currently valid combo, and
+    that combo must be confirmable."""
+    _upload(client, "bank", "流水号,户名,日期,金额(分)\nC1,丙公司,2026-11-10,100\n")
+    _upload(
+        client,
+        "internal",
+        "流水号,户名,日期,金额(分)\nJ1,丙公司,2026-11-10,100\nJ2,丙公司,2026-11-10,200\n",
+    )
+    client.post("/api/recompute")
+    cands = client.get("/api/candidates", params={"bank_serial": "C1"}).json()[
+        "candidates"
+    ]
+    assert {tuple(i["serial"] for i in c["internals"]) for c in cands} == {("J1",)}
+
+    # corrections swap the amounts: now only C1/J2 is valid
+    _upload(client, "internal", "流水号,户名,日期,金额(分)\nJ1,丙公司,2026-11-10,200\n")
+    _upload(client, "internal", "流水号,户名,日期,金额(分)\nJ2,丙公司,2026-11-10,100\n")
+    client.post("/api/recompute")
+    cands = client.get("/api/candidates", params={"bank_serial": "C1"}).json()[
+        "candidates"
+    ]
+    combos = {tuple(sorted(i["serial"] for i in c["internals"])) for c in cands}
+    assert combos == {("J2",)}
+
+    resp = client.post(
+        f"/api/candidates/{cands[0]['candidate_id']}/confirm",
+        json={"expected_versions": cands[0]["expected_versions"]},
+    )
+    assert resp.status_code == 200
+    assert resp.json()["bank"][0]["serial"] == "C1"
+
+
+def test_recompute_is_synchronous_and_complete(client):
+    """POST /api/recompute returns after publishing; the default candidate
+    list then contains every currently valid combination."""
+    _upload(client, "bank", "流水号,户名,日期,金额(分)\nD1,丁公司,2026-11-10,300\n")
+    _upload(
+        client,
+        "internal",
+        "流水号,户名,日期,金额(分)\nK1,丁公司,2026-11-10,100\nK2,丁公司,2026-11-10,200\nK3,丁公司,2026-11-10,300\n",
+    )
+    gen = client.post("/api/recompute").json()["generation"]
+    assert gen >= 1
+    cands = client.get("/api/candidates", params={"bank_serial": "D1"}).json()[
+        "candidates"
+    ]
+    combos = {tuple(sorted(i["serial"] for i in c["internals"])) for c in cands}
+    assert combos == {("K1", "K2"), ("K3",)}

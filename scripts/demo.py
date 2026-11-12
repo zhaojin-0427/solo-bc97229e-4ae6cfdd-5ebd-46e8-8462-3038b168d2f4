@@ -8,7 +8,9 @@ Walks the full lifecycle against a real SQLite database in ./data:
   3. list candidates and confirm one,
   4. show confirmed correspondences and unmatched details,
   5. correct a matched flow -> whole group disbands atomically,
-  6. reopen the database like a process restart -> data survives.
+  6. a late (stale-snapshot) recomputation interleaved with corrections
+     cannot overwrite newer published results,
+  7. reopen the database like a process restart -> data survives.
 
 Run:  python3 -I scripts/demo.py
 """
@@ -17,6 +19,8 @@ from __future__ import annotations
 
 import os
 import sys
+import tempfile
+import threading
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
@@ -115,7 +119,47 @@ def main() -> None:
     print("剩余匹配组:", list_groups(db))
     print("未匹配银行:", [f["serial"] for f in list_unmatched(db)["bank"]])
 
-    banner("8. 模拟重启：关闭后重新打开数据库，已确认数据仍在（先再确认一组）")
+    banner("8. 并发交错：迟到的旧重算不得覆盖新结果")
+    # B1=100, I1=100, I2=200 -> 初始只有 B1/I1；旧计算快照后，
+    # 核对员把 I1 改为 200、I2 改为 100，新重算发布 B1/I2；
+    # 旧计算随后才结束 —— 它的结果必须被丢弃，不能复活 B1/I1。
+    cdb = Database(os.path.join(tempfile.mkdtemp(), "concurrency.db"))
+    cdb_upload = lambda side, csv_text: upload(cdb, side, parse_flow_csv(csv_text))
+    cdb_upload(BANK, "流水号,户名,日期,金额(分)\nB1,甲公司,2026-11-10,100\n")
+    cdb_upload(INTERNAL, "流水号,户名,日期,金额(分)\nI1,甲公司,2026-11-10,100\nI2,甲公司,2026-11-10,200\n")
+    recompute(cdb)
+    combos = lambda: [
+        (c["bank"]["serial"], tuple(i["serial"] for i in c["internals"]))
+        for c in list_candidates(cdb)
+    ]
+    print("初始候选:", combos())
+
+    snap, release = threading.Event(), threading.Event()
+
+    def old_recompute() -> None:
+        # max_attempts=1：模拟“旧计算”只有一次迟到的发布机会
+        recompute(
+            cdb,
+            max_attempts=1,
+            after_snapshot=lambda epoch: snap.set(),
+            before_publish=lambda epoch: release.wait(5),
+        )
+
+    t = threading.Thread(target=old_recompute)
+    t.start()
+    snap.wait(5)
+    print("旧计算已快照（基于 I1=100/I2=200），挂起在发布前…")
+    cdb_upload(INTERNAL, "流水号,户名,日期,金额(分)\nI1,甲公司,2026-11-10,200\n")
+    cdb_upload(INTERNAL, "流水号,户名,日期,金额(分)\nI2,甲公司,2026-11-10,100\n")
+    recompute(cdb)
+    print("更正后新重算发布:", combos())
+    release.set()
+    t.join(5)
+    print("旧计算迟到结束后:", combos(), "（旧组合未复活，新组合未丢失）")
+    assert combos() == [("B1", ("I2",))], combos()
+    cdb.close()
+
+    banner("9. 模拟重启：关闭后重新打开数据库，已确认数据仍在（先再确认一组）")
     cand = next(c for c in list_candidates(db) if c["bank"]["serial"] == "B001")
     kept = confirm_candidate(db, cand["candidate_id"], cand["expected_versions"])
     db.close()

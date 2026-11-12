@@ -21,7 +21,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from app.csv_parser import CsvFormatError, parse_flow_csv  # noqa: E402
 from app.db import Database  # noqa: E402
 from app.ledger import upload  # noqa: E402
-from app.matching import compute_candidates  # noqa: E402
+from app.matching import compute_candidates, validate_combination  # noqa: E402
 from app.matching_service import (  # noqa: E402
     confirm_candidate,
     list_candidates,
@@ -35,11 +35,12 @@ from app.models import (  # noqa: E402
     MATCHED,
     UNMATCHED,
     CapacityExceeded,
+    FlowRow,
     NotFound,
     ParsedRow,
     StaleCandidateError,
 )
-from app.recompute import recompute  # noqa: E402
+from app.recompute import current_generation, recompute  # noqa: E402
 from app.repositories import load_flows  # noqa: E402
 
 
@@ -457,6 +458,359 @@ class ReconcileTestCase(unittest.TestCase):
                 f.result(timeout=30)
         # writers kept succeeding past any single-side cap? cap=100 -> stop earlier
         self.assert_invariant_no_half_match()
+
+    # ---- recompute publish concurrency (epoch-guarded) -------------------
+    def _combos(self) -> set:
+        """(bank, internals) tuples of the default (confirmable) list."""
+        return {
+            (
+                c["bank"]["serial"],
+                tuple(sorted(f["serial"] for f in c["internals"])),
+            )
+            for c in list_candidates(self.db)
+        }
+
+    @staticmethod
+    def _flowrow(d: dict) -> FlowRow:
+        return FlowRow(
+            serial=d["serial"],
+            name=d["name"],
+            txn_date=d["txn_date"],
+            amount=d["amount"],
+            status=d["status"],
+            group_id=d["group_id"],
+            version=d["version"],
+            content_hash=d["content_hash"],
+            updated_at=d["updated_at"],
+        )
+
+    def _data_epoch(self) -> int:
+        with self.db.read_tx() as conn:
+            row = conn.execute(
+                "SELECT value FROM meta WHERE key = 'data_epoch'"
+            ).fetchone()
+            return int(row["value"]) if row else 0
+
+    def assert_default_list_sound(self) -> None:
+        """Every default-list candidate matches current values & claim state."""
+        for c in list_candidates(self.db):  # one read tx -> consistent view
+            bank = self._flowrow(c["bank"])
+            internals = [self._flowrow(f) for f in c["internals"]]
+            self.assertEqual(bank.status, UNMATCHED, c)
+            self.assertTrue(
+                all(f.status == UNMATCHED for f in internals),
+                [f["serial"] for f in c["internals"]],
+            )
+            expected = c["expected_versions"]
+            self.assertEqual(bank.version, expected[bank.serial], c)
+            for f in internals:
+                self.assertEqual(f.version, expected[f.serial], c)
+            validate_combination(bank, internals)  # business rules still hold
+
+    def assert_default_list_complete(self) -> None:
+        """Default list == every candidate valid for the settled inputs."""
+        with self.db.read_tx() as conn:
+            specs = compute_candidates(
+                load_flows(conn, BANK), load_flows(conn, INTERNAL)
+            )
+        expected = {s.candidate_key for s in specs}
+        actual = {c["candidate_key"] for c in list_candidates(self.db)}
+        self.assertEqual(actual, expected)
+
+    def test_data_epoch_tracks_inputs_not_derived_writes(self) -> None:
+        e0 = self._data_epoch()
+        upload(self.db, BANK, rows(BANK, [("B1", "甲", "2026-11-10", 100)]))
+        upload(self.db, INTERNAL, rows(INTERNAL, [("I1", "甲", "2026-11-10", 100)]))
+        e1 = self._data_epoch()
+        self.assertGreater(e1, e0)
+        # identical re-upload changes nothing -> epoch must not move
+        upload(self.db, BANK, rows(BANK, [("B1", "甲", "2026-11-10", 100)]))
+        self.assertEqual(self._data_epoch(), e1)
+        # publishing candidates is a derived write -> epoch must not move
+        recompute(self.db)
+        self.assertEqual(self._data_epoch(), e1)
+        # a raw correction moves the epoch
+        upload(self.db, INTERNAL, rows(INTERNAL, [("I1", "甲", "2026-11-10", 200)]))
+        e2 = self._data_epoch()
+        self.assertGreater(e2, e1)
+        upload(self.db, INTERNAL, rows(INTERNAL, [("I1", "甲", "2026-11-10", 100)]))
+        e3 = self._data_epoch()
+        self.assertGreater(e3, e2)
+        # a confirmation (claim-status change) moves the epoch
+        recompute(self.db)
+        cand = list_candidates(self.db)[0]
+        confirm_candidate(self.db, cand["candidate_id"], cand["expected_versions"])
+        self.assertGreater(self._data_epoch(), e3)
+
+    def test_late_recompute_cannot_overwrite_newer_results(self) -> None:
+        """The exact reported interleaving: B1=100, I1=100, I2=200. The old
+        computation snapshots, then corrections swap I1->200 / I2->100, a new
+        recompute publishes B1/I2, and only then does the old computation
+        finish. It must neither re-list B1/I1 nor hide B1/I2."""
+        upload(self.db, BANK, rows(BANK, [("B1", "甲公司", "2026-11-10", 100)]))
+        upload(
+            self.db,
+            INTERNAL,
+            rows(
+                INTERNAL,
+                [
+                    ("I1", "甲公司", "2026-11-10", 100),
+                    ("I2", "甲公司", "2026-11-10", 200),
+                ],
+            ),
+        )
+        gen1 = recompute(self.db)
+        self.assertEqual(self._combos(), {("B1", ("I1",))})
+
+        snap = threading.Event()
+        release = threading.Event()
+        outcome: dict = {}
+
+        def stale_run() -> None:
+            # max_attempts=1: the old computation gets one late publish attempt
+            outcome["gen"] = recompute(
+                self.db,
+                max_attempts=1,
+                after_snapshot=lambda epoch: snap.set(),
+                before_publish=lambda epoch: release.wait(5),
+            )
+
+        t = threading.Thread(target=stale_run)
+        t.start()
+        self.assertTrue(snap.wait(5), "old recompute never took its snapshot")
+        # corrections land while the old computation is still running
+        upload(self.db, INTERNAL, rows(INTERNAL, [("I1", "甲公司", "2026-11-10", 200)]))
+        upload(self.db, INTERNAL, rows(INTERNAL, [("I2", "甲公司", "2026-11-10", 100)]))
+        gen2 = recompute(self.db)  # the new computation publishes B1/I2
+        self.assertGreater(gen2, gen1)
+        self.assertEqual(self._combos(), {("B1", ("I2",))})
+        release.set()
+        t.join(5)
+        self.assertFalse(t.is_alive())
+        # the late publish was discarded: old combo not resurrected, new kept
+        self.assertIsNone(outcome["gen"])
+        self.assertEqual(self._combos(), {("B1", ("I2",))})
+        self.assertEqual(current_generation(self.db), gen2)
+        self.assert_default_list_sound()
+        self.assert_default_list_complete()
+
+    def test_confirm_during_recompute_is_not_resurrected(self) -> None:
+        """A combination confirmed while a recompute is in flight must not
+        reappear as confirmable when that recompute finishes late."""
+        upload(
+            self.db,
+            BANK,
+            rows(
+                BANK,
+                [
+                    ("B1", "甲公司", "2026-11-10", 100),
+                    ("B2", "乙公司", "2026-11-10", 200),
+                ],
+            ),
+        )
+        upload(
+            self.db,
+            INTERNAL,
+            rows(
+                INTERNAL,
+                [
+                    ("I1", "甲公司", "2026-11-10", 100),
+                    ("I2", "乙公司", "2026-11-10", 200),
+                ],
+            ),
+        )
+        recompute(self.db)
+        target = next(
+            c for c in list_candidates(self.db) if c["bank"]["serial"] == "B1"
+        )
+
+        snap = threading.Event()
+        release = threading.Event()
+        outcome: dict = {}
+
+        def stale_run() -> None:
+            outcome["gen"] = recompute(
+                self.db,
+                max_attempts=1,
+                after_snapshot=lambda epoch: snap.set(),
+                before_publish=lambda epoch: release.wait(5),
+            )
+
+        t = threading.Thread(target=stale_run)
+        t.start()
+        self.assertTrue(snap.wait(5))
+        # the confirmation commits while the old computation is suspended
+        group = confirm_candidate(
+            self.db, target["candidate_id"], target["expected_versions"]
+        )
+        release.set()
+        t.join(5)
+        self.assertIsNone(outcome["gen"])
+        # the confirmed combination stays confirmed and is not re-listed
+        self.assertEqual(self._combos(), {("B2", ("I2",))})
+        self.assertEqual(
+            [g["group_id"] for g in list_groups(self.db)], [group["group_id"]]
+        )
+        # once settled, a completed recompute lists exactly the remaining set
+        recompute(self.db)
+        self.assertEqual(self._combos(), {("B2", ("I2",))})
+        self.assert_default_list_sound()
+        self.assert_default_list_complete()
+        self.assert_invariant_no_half_match()
+
+    def test_recompute_retries_and_converges_when_inputs_settle(self) -> None:
+        """A recompute that loses the race re-snapshots and publishes the
+        complete valid set once inputs stop changing."""
+        upload(self.db, BANK, rows(BANK, [("B1", "甲公司", "2026-11-10", 100)]))
+        upload(
+            self.db,
+            INTERNAL,
+            rows(
+                INTERNAL,
+                [
+                    ("I1", "甲公司", "2026-11-10", 100),
+                    ("I2", "甲公司", "2026-11-10", 200),
+                ],
+            ),
+        )
+        recompute(self.db)
+
+        first_attempt = threading.Event()
+        release = threading.Event()
+        attempts = {"n": 0}
+
+        def gate(epoch: int) -> None:
+            attempts["n"] += 1
+            if attempts["n"] == 1:
+                first_attempt.set()
+                release.wait(5)
+
+        outcome: dict = {}
+
+        def run() -> None:
+            # default max_attempts -> the call itself retries after the race
+            outcome["gen"] = recompute(self.db, after_snapshot=gate)
+
+        t = threading.Thread(target=run)
+        t.start()
+        self.assertTrue(first_attempt.wait(5))
+        upload(self.db, INTERNAL, rows(INTERNAL, [("I1", "甲公司", "2026-11-10", 200)]))
+        upload(self.db, INTERNAL, rows(INTERNAL, [("I2", "甲公司", "2026-11-10", 100)]))
+        release.set()
+        t.join(5)
+        self.assertFalse(t.is_alive())
+        self.assertGreaterEqual(attempts["n"], 2, "must have re-snapshotted")
+        self.assertIsNotNone(outcome["gen"])
+        self.assertEqual(self._combos(), {("B1", ("I2",))})
+        self.assert_default_list_sound()
+        self.assert_default_list_complete()
+
+    def test_interleaved_writes_recomputes_sound_and_complete(self) -> None:
+        """Uploads/corrections/confirmations interleaved with a continuous
+        recompute loop: the default list stays sound at every instant, and
+        once inputs settle a completed recompute lists every valid candidate.
+        """
+        upload(
+            self.db,
+            BANK,
+            rows(
+                BANK,
+                [
+                    ("B1", "甲公司", "2026-11-10", 100),
+                    ("B2", "甲公司", "2026-11-11", 200),
+                    ("B3", "乙公司", "2026-11-10", 300),
+                ],
+            ),
+        )
+        upload(
+            self.db,
+            INTERNAL,
+            rows(
+                INTERNAL,
+                [
+                    ("I1", "甲公司", "2026-11-10", 100),
+                    ("I2", "甲公司", "2026-11-11", 200),
+                    ("I3", "乙公司", "2026-11-10", 300),
+                    ("I4", "乙公司", "2026-11-11", 150),
+                ],
+            ),
+        )
+        recompute(self.db)
+
+        stop = threading.Event()
+
+        def recompute_loop() -> None:
+            while not stop.is_set():
+                recompute(self.db)
+
+        rt = threading.Thread(target=recompute_loop)
+        rt.start()
+        try:
+            upload(self.db, INTERNAL,
+                   rows(INTERNAL, [("I1", "甲公司", "2026-11-10", 150)]))
+            self.assert_default_list_sound()
+            upload(self.db, BANK,
+                   rows(BANK, [("B2", "甲公司", "2026-11-11", 250)]))
+            self.assert_default_list_sound()
+            for _ in range(3):
+                cands = list_candidates(self.db)
+                if not cands:
+                    break
+                cand = cands[0]
+                try:
+                    confirm_candidate(
+                        self.db, cand["candidate_id"], cand["expected_versions"]
+                    )
+                except (StaleCandidateError, NotFound):
+                    pass  # lost a race against the recompute loop; still fine
+                self.assert_default_list_sound()
+            upload(self.db, INTERNAL,
+                   rows(INTERNAL, [("I4", "乙公司", "2026-11-11", 100)]))
+            self.assert_default_list_sound()
+        finally:
+            stop.set()
+            rt.join(5)
+        self.assertFalse(rt.is_alive())
+        # inputs settled: one completed recompute -> exactly the valid set
+        recompute(self.db)
+        self.assert_default_list_sound()
+        self.assert_default_list_complete()
+        self.assert_invariant_no_half_match()
+
+    def test_worker_retries_when_publish_discarded(self) -> None:
+        """The background worker converges even when a publish is discarded
+        because inputs changed mid-computation."""
+        import app.recompute as rc
+
+        worker = rc.RecomputeWorker(self.db, debounce_seconds=0.02)
+        real = rc.recompute
+        calls = {"n": 0}
+
+        def flaky(db, **kwargs):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                return None  # simulate a discarded (lost-race) publish
+            return real(db, **kwargs)
+
+        rc.recompute = flaky
+        try:
+            worker.start()
+            upload(self.db, BANK, rows(BANK, [("B1", "甲", "2026-11-10", 100)]))
+            upload(self.db, INTERNAL, rows(INTERNAL, [("I1", "甲", "2026-11-10", 100)]))
+            worker.schedule()
+            for _ in range(100):
+                if list_candidates(self.db):
+                    break
+                threading.Event().wait(0.05)
+            self.assertTrue(list_candidates(self.db))
+            self.assertGreaterEqual(calls["n"], 2)
+            self.assert_default_list_sound()
+            self.assert_default_list_complete()
+        finally:
+            rc.recompute = real
+            worker._stop.set()
+            worker._wake.set()
+            worker._thread.join(timeout=5)
 
 
 if __name__ == "__main__":

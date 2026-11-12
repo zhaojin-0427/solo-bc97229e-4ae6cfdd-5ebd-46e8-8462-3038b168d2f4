@@ -126,7 +126,11 @@ async def get_candidates(
 @app.post("/api/candidates/{candidate_id}/confirm", tags=["candidates"])
 async def post_confirm(candidate_id: int, body: ConfirmRequest | None = None):
     versions = body.expected_versions if body is not None else {}
-    return confirm_candidate(app.state.db, candidate_id, versions)
+    group = confirm_candidate(app.state.db, candidate_id, versions)
+    # The claim change advances the input epoch; let the derived candidate
+    # list converge in the background (never inside the confirm transaction).
+    app.state.worker.schedule()
+    return group
 
 
 @app.get("/api/matches", tags=["matches"])
